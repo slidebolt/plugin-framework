@@ -23,6 +23,7 @@ type HostBridge interface {
 	GetDeviceRaw() map[string]interface{}
 	UpdateMetadata(name string, sid sdk.SourceID) error
 	UpdateState(status string) error
+	UpdateProperties(props map[string]interface{}) error
 	Disable(status string) error
 	UpdateRaw(data map[string]interface{}) error
 	Publish(subject string, payload map[string]interface{}) error
@@ -95,6 +96,11 @@ func NewWorker(id sdk.UUID, code string, logger sdk.Logger, bridge HostBridge) (
 	L.SetField(w.ctx, "UpdateState", L.NewFunction(func(L *lua.LState) int {
 		status := L.CheckString(1)
 		bridge.UpdateState(status)
+		return 0
+	}))
+	L.SetField(w.ctx, "UpdateProperties", L.NewFunction(func(L *lua.LState) int {
+		payload := FromLuaValue(L.CheckTable(1)).(map[string]interface{})
+		bridge.UpdateProperties(payload)
 		return 0
 	}))
 	L.SetField(w.ctx, "Disable", L.NewFunction(func(L *lua.LState) int {

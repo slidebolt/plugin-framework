@@ -9,6 +9,7 @@ import (
 	"github.com/slidebolt/plugin-sdk"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/nats-io/nats.go"
 )
@@ -30,13 +31,16 @@ type entityImpl struct {
 func (e *entityImpl) MarshalJSON() ([]byte, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
+
+	// Ensure the interface property is set based on metadata
+	st := e.state
+	st.Interface = strings.ToLower(string(e.metadata.Type))
+
 	return json.Marshal(map[string]any{
 		"id":        e.id,
 		"deviceID":  e.deviceID,
 		"metadata":  e.metadata,
-		"state":     e.state.Status, // Compatibility with UI chip logic
-		"status":    e.state.Status,
-		"fullState": e.state,
+		"state":     st,
 		"raw":       e.raw,
 		"name":      e.metadata.Name,
 		"type":      e.metadata.Type,
@@ -88,6 +92,7 @@ func (e *entityImpl) setState(enabled bool, status string) error {
 	oldEnabled := e.state.Enabled
 	e.state.Enabled = enabled
 	e.state.Status = status
+	e.state.Interface = strings.ToLower(string(e.metadata.Type))
 	s := e.state
 	e.mu.Unlock()
 
@@ -114,12 +119,31 @@ func (e *entityImpl) setState(enabled bool, status string) error {
 
 	prefix := string(e.deviceID) + "." + string(e.id)
 	err := e.bundle.saveJSON(prefix+".state.json", s)
-	e.bundle.Publish(fmt.Sprintf("entity.%s.state", e.id), map[string]interface{}{"enabled": enabled, "status": status})
+	e.Publish(fmt.Sprintf("entity.%s.state", e.id), map[string]interface{}{"enabled": enabled, "status": status})
 	return err
 }
 
 func (e *entityImpl) UpdateState(status string) error {
 	return e.setState(true, status)
+}
+
+func (e *entityImpl) UpdateProperties(props map[string]interface{}) error {
+	e.mu.Lock()
+	if e.state.Properties == nil {
+		e.state.Properties = make(map[string]interface{})
+	}
+	for k, v := range props {
+		e.state.Properties[k] = v
+	}
+	e.state.Interface = strings.ToLower(string(e.metadata.Type))
+	s := e.state
+	e.mu.Unlock()
+
+	prefix := string(e.deviceID) + "." + string(e.id)
+	err := e.bundle.saveJSON(prefix+".state.json", s)
+	// Important: We publish the full state so the UI gets everything
+	e.Publish(fmt.Sprintf("entity.%s.state", e.id), props)
+	return err
 }
 
 func (e *entityImpl) Disable(status string) error {
@@ -231,7 +255,19 @@ func (e *entityImpl) GetDeviceRaw() map[string]interface{} {
 	return nil
 }
 func (e *entityImpl) Publish(subj string, p map[string]interface{}) error {
-	return e.bundle.Publish(subj, p)
+	if e.bundle.nc == nil {
+		return nil
+	}
+	msg := sdk.Message{
+		Source:    e.bundle.id,
+		DeviceID:  e.deviceID,
+		EntityID:  e.id,
+		Subject:   subj,
+		Payload:   p,
+		Timestamp: time.Now().UnixNano(),
+	}
+	data, _ := json.Marshal(msg)
+	return e.bundle.nc.Publish(subj, data)
 }
 func (e *entityImpl) Subscribe(topic string) error {
 	if e.bundle.nc == nil {

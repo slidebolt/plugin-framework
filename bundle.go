@@ -139,34 +139,62 @@ func (b *bundleImpl) EveryMinute(handler func()) {
 
 func (b *bundleImpl) loadFromDisk() {
 	files, _ := ioutil.ReadDir(b.statePath)
+
+	// Collect work to do after releasing the write lock; initWorker and
+	// broadcastRegistration both need to acquire b.mu themselves.
+	var devicesToWake []*deviceImpl
+	var entitiesToWake []*entityImpl
+
+	b.mu.Lock()
 	for _, f := range files {
 		name := f.Name()
-		if filepath.Ext(name) == ".json" {
-			count := strings.Count(name, ".")
-			if count == 1 {
-				id := sdk.UUID(strings.TrimSuffix(name, ".json"))
-				if id != b.id {
-					d := &deviceImpl{id: id, bundle: b}
-					b.loadJSON(string(id)+".json", &d.metadata)
-					b.loadJSON(string(id)+".state.json", &d.state)
-					b.loadJSON(string(id)+".raw.json", &d.raw)
-					b.devices[id] = d
-					d.initWorker()
-					b.broadcastRegistration(d)
-				}
-			} else if count == 2 {
-				parts := strings.Split(name, ".")
-				deviceID := sdk.UUID(parts[0])
-				entityID := sdk.UUID(parts[1])
-				prefix := deviceID.String() + "." + entityID.String()
-				_, ei := b.createEntityObject(entityID, deviceID)
-				b.loadJSON(prefix+".json", &ei.metadata)
-				b.loadJSON(prefix+".state.json", &ei.state)
-				b.loadJSON(prefix+".raw.json", &ei.raw)
-				b.entities[entityID] = ei
-				ei.initWorker()
-			}
+		if filepath.Ext(name) != ".json" {
+			continue
 		}
+		count := strings.Count(name, ".")
+		switch count {
+		case 1:
+			id := sdk.UUID(strings.TrimSuffix(name, ".json"))
+			if id == b.id {
+				continue
+			}
+			d := &deviceImpl{id: id, bundle: b}
+			b.loadJSON(string(id)+".json", &d.metadata)
+			b.loadJSON(string(id)+".state.json", &d.state)
+			b.loadJSON(string(id)+".raw.json", &d.raw)
+			b.devices[id] = d
+			devicesToWake = append(devicesToWake, d)
+		case 2:
+			parts := strings.Split(name, ".")
+			// parts[1] is "state" or "raw" for device state/raw files
+			// (e.g. {uuid}.state.json, {uuid}.raw.json).  Only the form
+			// {deviceUUID}.{entityUUID}.json has a UUID-shaped parts[1].
+			if parts[1] == "state" || parts[1] == "raw" {
+				continue
+			}
+			deviceID := sdk.UUID(parts[0])
+			entityID := sdk.UUID(parts[1])
+			prefix := deviceID.String() + "." + entityID.String()
+			// Construct entityImpl directly — createEntityObject acquires
+			// b.mu.RLock() which would deadlock against the Lock() we hold.
+			ei := &entityImpl{id: entityID, deviceID: deviceID, bundle: b}
+			b.loadJSON(prefix+".json", &ei.metadata)
+			b.loadJSON(prefix+".state.json", &ei.state)
+			b.loadJSON(prefix+".raw.json", &ei.raw)
+			b.entities[entityID] = ei
+			entitiesToWake = append(entitiesToWake, ei)
+		}
+	}
+	b.mu.Unlock()
+
+	// Workers and NATS subscriptions are started only after all state is in
+	// memory and the write lock is released.
+	for _, ei := range entitiesToWake {
+		ei.initWorker()
+	}
+	for _, d := range devicesToWake {
+		d.initWorker()
+		b.broadcastRegistration(d)
 	}
 }
 
@@ -180,6 +208,7 @@ func (b *bundleImpl) broadcastRegistration(d *deviceImpl) {
 
 	// Capture all entities for this device
 	entities := make(map[sdk.UUID]interface{})
+	b.mu.RLock()
 	for _, eid := range d.metadata.Entities {
 		if e, ok := b.entities[eid]; ok {
 			e.mu.RLock()
@@ -195,6 +224,7 @@ func (b *bundleImpl) broadcastRegistration(d *deviceImpl) {
 			e.mu.RUnlock()
 		}
 	}
+	b.mu.RUnlock()
 
 	payload := struct {
 		BundleID sdk.UUID `json:"bundle_id"`

@@ -10,6 +10,7 @@ import (
 	"github.com/slidebolt/plugin-sdk"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/nats-io/nats.go"
 )
@@ -41,11 +42,14 @@ func (d *deviceImpl) MarshalJSON() ([]byte, error) {
 		}
 	}
 
+	st := d.state
+	st.Interface = "device"
+
 	return json.Marshal(map[string]any{
 		"uuid":     d.id,
 		"bundle":   d.bundle.id,
 		"metadata": d.metadata,
-		"state":    d.state,
+		"state":    st,
 		"entities": entities,
 		"raw":      d.raw,
 		"name":     d.metadata.Name, // Helper for UI
@@ -94,6 +98,7 @@ func (d *deviceImpl) setState(enabled bool, status string) error {
 	oldEnabled := d.state.Enabled
 	d.state.Enabled = enabled
 	d.state.Status = status
+	d.state.Interface = "device"
 	s := d.state
 	d.mu.Unlock()
 
@@ -127,6 +132,23 @@ func (d *deviceImpl) setState(enabled bool, status string) error {
 
 func (d *deviceImpl) UpdateState(status string) error {
 	return d.setState(true, status)
+}
+
+func (d *deviceImpl) UpdateProperties(props map[string]interface{}) error {
+	d.mu.Lock()
+	if d.state.Properties == nil {
+		d.state.Properties = make(map[string]interface{})
+	}
+	for k, v := range props {
+		d.state.Properties[k] = v
+	}
+	d.state.Interface = "device"
+	s := d.state
+	d.mu.Unlock()
+
+	err := d.bundle.saveJSON(string(d.id)+".state.json", s)
+	d.Publish(fmt.Sprintf("device.%s.state", d.id), props)
+	return err
 }
 
 func (d *deviceImpl) Disable(status string) error {
@@ -227,8 +249,18 @@ func (d *deviceImpl) GetState() map[string]interface{} {
 func (d *deviceImpl) GetRaw() map[string]interface{}       { return d.Raw() }
 func (d *deviceImpl) GetDeviceRaw() map[string]interface{} { return d.Raw() }
 func (d *deviceImpl) Publish(subj string, p map[string]interface{}) error {
-
-	return d.bundle.Publish(subj, p)
+	if d.bundle.nc == nil {
+		return nil
+	}
+	msg := sdk.Message{
+		Source:    d.bundle.id,
+		DeviceID:  d.id,
+		Subject:   subj,
+		Payload:   p,
+		Timestamp: time.Now().UnixNano(),
+	}
+	data, _ := json.Marshal(msg)
+	return d.bundle.nc.Publish(subj, data)
 }
 func (d *deviceImpl) Subscribe(topic string) error {
 	if d.bundle.nc == nil {

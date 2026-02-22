@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"github.com/slidebolt/plugin-sdk"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -396,4 +397,102 @@ func TestIntegration_ExtendedEntityTypes(t *testing.T) {
 	if cover.Raw()["pos"].(float64) != 75 {
 		t.Errorf("Cover SetPosition failed to reach Lua. Got: %v", cover.Raw()["pos"])
 	}
+}
+
+// TestIntegration_LoadFromDisk verifies that all state written during a
+// "first boot" is fully read back into memory on a simulated restart before
+// any new devices or entities are created.  This is the core guarantee: read
+// existing state first, create new state only when something is genuinely
+// absent.
+func TestIntegration_LoadFromDisk(t *testing.T) {
+	setupIntegrationTest(t)
+	bundleID := "00000000-0000-0000-0000-000000000020"
+
+	// --- First boot: create a device with two entities and set state on each.
+	b1, err := RegisterBundle(bundleID)
+	if err != nil {
+		t.Fatalf("first RegisterBundle: %v", err)
+	}
+
+	dev, _ := b1.CreateDevice()
+	devID := dev.ID()
+	dev.UpdateMetadata("Sensor Hub", "hub-1")
+	dev.UpdateRaw(map[string]interface{}{"firmware": "2.0"})
+
+	ent1, _ := dev.CreateEntity(sdk.TYPE_SENSOR)
+	ent1.UpdateMetadata("Temperature", "temp-1")
+	ent1.UpdateRaw(map[string]interface{}{"value": 21.5})
+
+	ent2, _ := dev.CreateEntity(sdk.TYPE_SWITCH)
+	ent2.UpdateMetadata("Power Switch", "switch-1")
+
+	ent1ID := ent1.ID()
+	ent2ID := ent2.ID()
+
+	// Simulate process exit: release the bundle lock so a second registration
+	// succeeds, and wipe the in-memory registry.
+	_ = syscall.Flock(int(b1.(*bundleImpl).lockFile.Fd()), syscall.LOCK_UN)
+	_ = b1.(*bundleImpl).lockFile.Close()
+
+	bundlesMu.Lock()
+	bundles = make(map[sdk.UUID]*bundleImpl)
+	bundlesMu.Unlock()
+
+	// --- Simulated restart: RegisterBundle must read all state from disk
+	// before the caller gets a chance to call CreateDevice.
+	b2, err := RegisterBundle(bundleID)
+	if err != nil {
+		t.Fatalf("second RegisterBundle: %v", err)
+	}
+
+	// 1. Device must be present in memory immediately — no CreateDevice call needed.
+	reloaded, err := b2.GetDevice(devID)
+	if err != nil {
+		t.Fatalf("device not loaded from disk: %v", err)
+	}
+	if reloaded.Metadata().Name != "Sensor Hub" {
+		t.Errorf("device name: got %q, want %q", reloaded.Metadata().Name, "Sensor Hub")
+	}
+	if reloaded.Raw()["firmware"] != "2.0" {
+		t.Errorf("device raw: got %v, want 2.0", reloaded.Raw()["firmware"])
+	}
+
+	// 2. Both entities must be present and their state intact.
+	ents, _ := reloaded.GetEntities()
+	if len(ents) != 2 {
+		t.Errorf("entity count after reload: got %d, want 2", len(ents))
+	}
+
+	obj1, ok := b2.GetBySourceID("temp-1")
+	if !ok {
+		t.Fatal("temp-1 entity not found by source ID after reload")
+	}
+	if obj1.(sdk.Entity).ID() != ent1ID {
+		t.Errorf("temp-1 UUID mismatch after reload")
+	}
+	if obj1.(sdk.Entity).Raw()["value"] != 21.5 {
+		t.Errorf("temp-1 raw not reloaded: %v", obj1.(sdk.Entity).Raw())
+	}
+
+	_, ok = b2.GetBySourceID("switch-1")
+	if !ok {
+		t.Fatal("switch-1 entity not found by source ID after reload")
+	}
+
+	// 3. No duplicate devices: GetDevices must return exactly the one reloaded device.
+	devs := b2.GetDevices()
+	if len(devs) != 1 {
+		t.Errorf("device count after reload: got %d, want 1", len(devs))
+	}
+
+	// 4. In-memory entity map must be consistent with what's on disk.
+	b2impl := b2.(*bundleImpl)
+	b2impl.mu.RLock()
+	entityCount := len(b2impl.entities)
+	b2impl.mu.RUnlock()
+	if entityCount != 2 {
+		t.Errorf("b.entities count: got %d, want 2", entityCount)
+	}
+
+	_ = ent2ID // referenced above via switch-1 lookup
 }

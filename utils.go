@@ -4,7 +4,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"os"
-	"plugin-sdk"
+	"github.com/slidebolt/plugin-sdk"
 )
 
 func generateUUID() sdk.UUID {

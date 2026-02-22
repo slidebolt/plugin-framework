@@ -1,13 +1,13 @@
-module plugin-framework
+module github.com/slidebolt/plugin-framework
 
 go 1.24
 
-replace plugin-sdk => ../plugin-sdk
+// replace plugin-sdk => ../plugin-sdk
 
 require (
 	github.com/nats-io/nats.go v1.48.0
 	github.com/yuin/gopher-lua v1.1.1
-	plugin-sdk v0.0.0-00010101000000-000000000000
+	// github.com/slidebolt/plugin-sdk v0.0.0
 )
 
 require (

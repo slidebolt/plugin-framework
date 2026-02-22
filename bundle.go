@@ -6,7 +6,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"plugin-sdk"
+	"github.com/slidebolt/plugin-sdk"
 	"strings"
 	"sync"
 	"time"

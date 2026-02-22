@@ -2,7 +2,7 @@ package script
 
 import (
 	"fmt"
-	"plugin-sdk"
+	"github.com/slidebolt/plugin-sdk"
 	"sync"
 
 	"github.com/yuin/gopher-lua"

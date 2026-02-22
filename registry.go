@@ -1,7 +1,7 @@
 package framework
 
 import (
-	"plugin-sdk"
+	"github.com/slidebolt/plugin-sdk"
 )
 
 type frameworkRegistry struct{}

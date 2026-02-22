@@ -6,8 +6,8 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"plugin-framework/pkg/script"
-	"plugin-sdk"
+	"github.com/slidebolt/plugin-framework/pkg/script"
+	"github.com/slidebolt/plugin-sdk"
 	"strings"
 	"sync"
 

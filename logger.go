@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"plugin-sdk"
+	"github.com/slidebolt/plugin-sdk"
 	"time"
 )
 

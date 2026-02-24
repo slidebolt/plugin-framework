@@ -3,10 +3,10 @@ package framework
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/slidebolt/plugin-sdk"
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"github.com/slidebolt/plugin-sdk"
 	"strings"
 	"sync"
 	"time"
@@ -27,8 +27,90 @@ type bundleImpl struct {
 	onConfigure func()
 }
 
+type objectHealthSnapshot struct {
+	ID                            sdk.UUID `json:"id"`
+	Kind                          string   `json:"kind"`
+	Enabled                       bool     `json:"enabled"`
+	WorkerLoaded                  bool     `json:"worker_loaded"`
+	CommandSubscriptionInstalled  bool     `json:"command_subscription_installed"`
+	ScriptCommandHandlerInstalled bool     `json:"script_command_handler_installed"`
+	UserCommandHandlers           int      `json:"user_command_handlers"`
+}
+
+type bundleHealthSnapshot struct {
+	BundleID  string `json:"bundle_id"`
+	Status    string `json:"status"`
+	Framework struct {
+		NATSConnected         bool `json:"nats_connected"`
+		RPCReady              bool `json:"rpc_ready"`
+		DevicesTotal          int  `json:"devices_total"`
+		EntitiesTotal         int  `json:"entities_total"`
+		ScriptedDevicesTotal  int  `json:"scripted_devices_total"`
+		ScriptedEntitiesTotal int  `json:"scripted_entities_total"`
+	} `json:"framework"`
+	CommandRuntime struct {
+		ScriptedDevices  []objectHealthSnapshot `json:"scripted_devices"`
+		ScriptedEntities []objectHealthSnapshot `json:"scripted_entities"`
+	} `json:"command_runtime"`
+}
+
 func (b *bundleImpl) ID() sdk.UUID    { return b.id }
 func (b *bundleImpl) Log() sdk.Logger { return b.logger }
+
+func (b *bundleImpl) healthSnapshot() bundleHealthSnapshot {
+	var out bundleHealthSnapshot
+	out.BundleID = string(b.id)
+	out.Status = "ok"
+	out.Framework.NATSConnected = b.nc != nil && b.nc.IsConnected()
+	out.Framework.RPCReady = b.nc != nil
+
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	out.Framework.DevicesTotal = len(b.devices)
+	out.Framework.EntitiesTotal = len(b.entities)
+
+	for _, d := range b.devices {
+		d.mu.RLock()
+		scripted := d.worker != nil || d.scriptCmdHandler != nil || strings.TrimSpace(d.Script()) != "" && strings.TrimSpace(d.Script()) != "-- OnLoad() {}"
+		if scripted {
+			out.Framework.ScriptedDevicesTotal++
+			out.CommandRuntime.ScriptedDevices = append(out.CommandRuntime.ScriptedDevices, objectHealthSnapshot{
+				ID:                            d.id,
+				Kind:                          "device",
+				Enabled:                       d.state.Enabled,
+				WorkerLoaded:                  d.worker != nil,
+				CommandSubscriptionInstalled:  d.cmdSub != nil,
+				ScriptCommandHandlerInstalled: d.scriptCmdHandler != nil,
+				UserCommandHandlers:           len(d.handlers),
+			})
+		}
+		d.mu.RUnlock()
+	}
+
+	for _, e := range b.entities {
+		e.mu.RLock()
+		scripted := e.worker != nil || e.scriptCmdHandler != nil || strings.TrimSpace(e.Script()) != "" && strings.TrimSpace(e.Script()) != "-- OnLoad() {}"
+		if scripted {
+			out.Framework.ScriptedEntitiesTotal++
+			out.CommandRuntime.ScriptedEntities = append(out.CommandRuntime.ScriptedEntities, objectHealthSnapshot{
+				ID:                            e.id,
+				Kind:                          "entity",
+				Enabled:                       e.state.Enabled,
+				WorkerLoaded:                  e.worker != nil,
+				CommandSubscriptionInstalled:  e.cmdSub != nil,
+				ScriptCommandHandlerInstalled: e.scriptCmdHandler != nil,
+				UserCommandHandlers:           len(e.handlers),
+			})
+		}
+		e.mu.RUnlock()
+	}
+
+	if !out.Framework.NATSConnected {
+		out.Status = "degraded"
+	}
+	return out
+}
 
 func (b *bundleImpl) OnConfigure(handler func()) {
 	b.mu.Lock()
@@ -160,6 +242,16 @@ func (b *bundleImpl) loadFromDisk() {
 			}
 			d := &deviceImpl{id: id, bundle: b}
 			b.loadJSON(string(id)+".json", &d.metadata)
+
+			// Auto-migration for devices
+			if d.metadata.LocalName == "" && d.metadata.Name != "" {
+				d.metadata.LocalName = d.metadata.Name
+			}
+			if d.metadata.SourceName == "" && d.metadata.Name != "" {
+				d.metadata.SourceName = d.metadata.Name
+			}
+			d.recalculateName()
+
 			b.loadJSON(string(id)+".state.json", &d.state)
 			b.loadJSON(string(id)+".raw.json", &d.raw)
 			b.devices[id] = d
@@ -179,6 +271,16 @@ func (b *bundleImpl) loadFromDisk() {
 			// b.mu.RLock() which would deadlock against the Lock() we hold.
 			ei := &entityImpl{id: entityID, deviceID: deviceID, bundle: b}
 			b.loadJSON(prefix+".json", &ei.metadata)
+
+			// Auto-migration for entities
+			if ei.metadata.LocalName == "" && ei.metadata.Name != "" {
+				ei.metadata.LocalName = ei.metadata.Name
+			}
+			if ei.metadata.SourceName == "" && ei.metadata.Name != "" {
+				ei.metadata.SourceName = ei.metadata.Name
+			}
+			ei.recalculateName()
+
 			b.loadJSON(prefix+".state.json", &ei.state)
 			b.loadJSON(prefix+".raw.json", &ei.raw)
 			b.entities[entityID] = ei
@@ -302,6 +404,248 @@ func (b *bundleImpl) GetDevices() []sdk.Device {
 	return devs
 }
 
+func (b *bundleImpl) GetByUUID(id sdk.UUID) (interface{}, bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if d, ok := b.devices[id]; ok {
+		return d, true
+	}
+	if e, ok := b.entities[id]; ok {
+		ent, _ := b.createEntityObject(e.id, e.deviceID)
+		return ent, true
+	}
+	return nil, false
+}
+
+func (b *bundleImpl) GetRemoteObject(id sdk.UUID) (interface{}, bool) {
+	if b.nc == nil {
+		return nil, false
+	}
+	msg, err := b.nc.Request("registry.get_object", []byte(id), 1*time.Second)
+	if err != nil || len(msg.Data) <= 2 {
+		return nil, false
+	}
+	return b.parseRemoteObject(id, msg.Data)
+}
+
+func (b *bundleImpl) parseRemoteObject(id sdk.UUID, data []byte) (interface{}, bool) {
+	var kindProbe struct {
+		ID       string                     `json:"id"`
+		UUID     string                     `json:"uuid"`
+		DeviceID string                     `json:"deviceID"`
+		Type     string                     `json:"type"`
+		Entities map[string]json.RawMessage `json:"entities"`
+	}
+	if err := json.Unmarshal(data, &kindProbe); err != nil {
+		return nil, false
+	}
+
+	if len(kindProbe.Entities) > 0 {
+		var dev struct {
+			UUID     string `json:"uuid"`
+			Metadata struct {
+				ID       string   `json:"id"`
+				Name     string   `json:"name"`
+				SourceID string   `json:"source_id"`
+				Labels   []string `json:"labels"`
+			} `json:"metadata"`
+			State struct {
+				Enabled    bool                   `json:"enabled"`
+				Status     string                 `json:"status"`
+				Properties map[string]interface{} `json:"properties"`
+			} `json:"state"`
+			Entities map[string]struct {
+				DeviceID string `json:"deviceID"`
+				Metadata struct {
+					ID           string   `json:"id"`
+					EntityID     string   `json:"entity_id"`
+					Name         string   `json:"name"`
+					SourceID     string   `json:"source_id"`
+					Type         string   `json:"type"`
+					Capabilities []string `json:"capabilities"`
+					Labels       []string `json:"labels"`
+				} `json:"metadata"`
+				State struct {
+					Enabled    bool                   `json:"enabled"`
+					Status     string                 `json:"status"`
+					Properties map[string]interface{} `json:"properties"`
+				} `json:"state"`
+			} `json:"entities"`
+		}
+		if err := json.Unmarshal(data, &dev); err != nil {
+			return nil, false
+		}
+		if ent, ok := dev.Entities[string(id)]; ok {
+			return &remoteEntityProxy{
+				remoteProxyBase: remoteProxyBase{
+					id:       id,
+					deviceID: sdk.UUID(ent.DeviceID),
+					bundle:   b,
+				},
+				metadata: sdk.EntityMetadata{
+					ID:           sdk.UUID(ent.Metadata.ID),
+					EntityID:     sdk.UUID(ent.Metadata.EntityID),
+					Name:         ent.Metadata.Name,
+					SourceID:     sdk.SourceID(ent.Metadata.SourceID),
+					Type:         sdk.EntityType(ent.Metadata.Type),
+					Capabilities: ent.Metadata.Capabilities,
+					Labels:       ent.Metadata.Labels,
+				},
+				state: sdk.EntityState{
+					Enabled:    ent.State.Enabled,
+					Status:     ent.State.Status,
+					Properties: ent.State.Properties,
+				},
+			}, true
+		}
+		deviceID := dev.UUID
+		if deviceID == "" {
+			deviceID = dev.Metadata.ID
+		}
+		if deviceID != "" && deviceID != string(id) {
+			return nil, false
+		}
+		return &remoteDeviceProxy{
+			remoteProxyBase: remoteProxyBase{
+				id:       id,
+				deviceID: sdk.UUID(deviceID),
+				bundle:   b,
+			},
+			metadata: sdk.DeviceMetadata{
+				ID:       sdk.UUID(dev.Metadata.ID),
+				Name:     dev.Metadata.Name,
+				SourceID: sdk.SourceID(dev.Metadata.SourceID),
+				Labels:   dev.Metadata.Labels,
+			},
+			state: sdk.DeviceState{
+				Enabled:    dev.State.Enabled,
+				Status:     dev.State.Status,
+				Properties: dev.State.Properties,
+			},
+		}, true
+	}
+
+	// Future-proof: support a bare-entity payload if core ever returns one directly.
+	var ent struct {
+		ID       string `json:"id"`
+		DeviceID string `json:"deviceID"`
+		Metadata struct {
+			ID           string   `json:"id"`
+			EntityID     string   `json:"entity_id"`
+			Name         string   `json:"name"`
+			LocalName    string   `json:"local_name"`
+			SourceName   string   `json:"source_name"`
+			SourceID     string   `json:"source_id"`
+			Type         string   `json:"type"`
+			Capabilities []string `json:"capabilities"`
+			Labels       []string `json:"labels"`
+		} `json:"metadata"`
+		State struct {
+			Enabled    bool                   `json:"enabled"`
+			Status     string                 `json:"status"`
+			Properties map[string]interface{} `json:"properties"`
+		} `json:"state"`
+	}
+	if err := json.Unmarshal(data, &ent); err == nil {
+		entityID := ent.ID
+		if entityID == "" {
+			entityID = ent.Metadata.EntityID
+		}
+		if entityID == string(id) && ent.Metadata.Type != "" && ent.DeviceID != "" {
+			// Migrate Name if needed
+			localName := ent.Metadata.LocalName
+			sourceName := ent.Metadata.SourceName
+			if localName == "" {
+				localName = ent.Metadata.Name
+			}
+			if sourceName == "" {
+				sourceName = ent.Metadata.Name
+			}
+
+			return &remoteEntityProxy{
+				remoteProxyBase: remoteProxyBase{
+					id:       id,
+					deviceID: sdk.UUID(ent.DeviceID),
+					bundle:   b,
+				},
+				metadata: sdk.EntityMetadata{
+					ID:           sdk.UUID(ent.Metadata.ID),
+					EntityID:     sdk.UUID(ent.Metadata.EntityID),
+					Name:         ent.Metadata.Name,
+					LocalName:    localName,
+					SourceName:   sourceName,
+					SourceID:     sdk.SourceID(ent.Metadata.SourceID),
+					Type:         sdk.EntityType(ent.Metadata.Type),
+					Capabilities: ent.Metadata.Capabilities,
+					Labels:       ent.Metadata.Labels,
+				},
+				state: sdk.EntityState{
+					Enabled:    ent.State.Enabled,
+					Status:     ent.State.Status,
+					Properties: ent.State.Properties,
+				},
+			}, true
+		}
+	}
+
+	var dev struct {
+		UUID     string `json:"uuid"`
+		Metadata struct {
+			ID         string   `json:"id"`
+			Name       string   `json:"name"`
+			LocalName  string   `json:"local_name"`
+			SourceName string   `json:"source_name"`
+			SourceID   string   `json:"source_id"`
+			Labels     []string `json:"labels"`
+		} `json:"metadata"`
+		State struct {
+			Enabled    bool                   `json:"enabled"`
+			Status     string                 `json:"status"`
+			Properties map[string]interface{} `json:"properties"`
+		} `json:"state"`
+	}
+	if err := json.Unmarshal(data, &dev); err == nil {
+		deviceID := dev.UUID
+		if deviceID == "" {
+			deviceID = dev.Metadata.ID
+		}
+		if deviceID == string(id) && deviceID != "" {
+			// Migrate Name if needed
+			localName := dev.Metadata.LocalName
+			sourceName := dev.Metadata.SourceName
+			if localName == "" {
+				localName = dev.Metadata.Name
+			}
+			if sourceName == "" {
+				sourceName = dev.Metadata.Name
+			}
+
+			return &remoteDeviceProxy{
+				remoteProxyBase: remoteProxyBase{
+					id:       id,
+					deviceID: sdk.UUID(deviceID),
+					bundle:   b,
+				},
+				metadata: sdk.DeviceMetadata{
+					ID:         sdk.UUID(dev.Metadata.ID),
+					Name:       dev.Metadata.Name,
+					LocalName:  localName,
+					SourceName: sourceName,
+					SourceID:   sdk.SourceID(dev.Metadata.SourceID),
+					Labels:     dev.Metadata.Labels,
+				},
+				state: sdk.DeviceState{
+					Enabled:    dev.State.Enabled,
+					Status:     dev.State.Status,
+					Properties: dev.State.Properties,
+				},
+			}, true
+		}
+	}
+
+	return nil, false
+}
+
 func (b *bundleImpl) DeleteDevice(id sdk.UUID) error {
 	b.mu.RLock()
 	d, ok := b.devices[id]
@@ -356,8 +700,9 @@ func (b *bundleImpl) GetEntities() ([]sdk.Entity, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	ents := make([]sdk.Entity, 0, len(b.entities))
-	for _, e := range b.entities {
-		ents = append(ents, e)
+	for id, e := range b.entities {
+		obj, _ := b.createEntityObject(id, e.deviceID)
+		ents = append(ents, obj)
 	}
 	return ents, nil
 }

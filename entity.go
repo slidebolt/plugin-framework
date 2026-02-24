@@ -3,10 +3,10 @@ package framework
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
-	"path/filepath"
 	"github.com/slidebolt/plugin-framework/pkg/script"
 	"github.com/slidebolt/plugin-sdk"
+	"io/ioutil"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -15,17 +15,19 @@ import (
 )
 
 type entityImpl struct {
-	id        sdk.UUID
-	deviceID  sdk.UUID
-	bundle    *bundleImpl
-	worker    *script.Worker
-	sub       *nats.Subscription
-	cmdSub    *nats.Subscription
-	extraSubs []*nats.Subscription
-	metadata  sdk.EntityMetadata
-	state     sdk.EntityState
-	raw       map[string]interface{}
-	mu        sync.RWMutex
+	id               sdk.UUID
+	deviceID         sdk.UUID
+	bundle           *bundleImpl
+	worker           *script.Worker
+	sub              *nats.Subscription
+	cmdSub           *nats.Subscription
+	handlers         []sdk.CommandHandler
+	scriptCmdHandler sdk.CommandHandler
+	extraSubs        []*nats.Subscription
+	metadata         sdk.EntityMetadata
+	state            sdk.EntityState
+	raw              map[string]interface{}
+	mu               sync.RWMutex
 }
 
 func (e *entityImpl) MarshalJSON() ([]byte, error) {
@@ -37,13 +39,13 @@ func (e *entityImpl) MarshalJSON() ([]byte, error) {
 	st.Interface = strings.ToLower(string(e.metadata.Type))
 
 	return json.Marshal(map[string]any{
-		"id":        e.id,
-		"deviceID":  e.deviceID,
-		"metadata":  e.metadata,
-		"state":     st,
-		"raw":       e.raw,
-		"name":      e.metadata.Name,
-		"type":      e.metadata.Type,
+		"id":       e.id,
+		"deviceID": e.deviceID,
+		"metadata": e.metadata,
+		"state":    st,
+		"raw":      e.raw,
+		"name":     e.metadata.Name,
+		"type":     e.metadata.Type,
 	})
 }
 
@@ -75,16 +77,140 @@ func (e *entityImpl) StateScript() string {
 	return string(b)
 }
 
+func (e *entityImpl) recalculateName() {
+	if e.metadata.LocalName != "" {
+		e.metadata.Name = e.metadata.LocalName
+	} else if e.metadata.SourceName != "" {
+		e.metadata.Name = e.metadata.SourceName
+	} else if e.metadata.SourceID != "" {
+		e.metadata.Name = string(e.metadata.SourceID)
+	} else {
+		e.metadata.Name = string(e.id)
+	}
+}
+
 func (e *entityImpl) UpdateMetadata(name string, sourceID sdk.SourceID) error {
 	e.mu.Lock()
-	e.metadata.Name = name
+	e.metadata.SourceName = name
 	e.metadata.SourceID = sourceID
+	e.recalculateName()
 	m := e.metadata
 	e.mu.Unlock()
 
 	prefix := string(e.deviceID) + "." + string(e.id)
 	err := e.bundle.saveJSON(prefix+".json", m)
-	e.bundle.Publish(fmt.Sprintf("entity.%s.metadata", e.id), map[string]interface{}{"name": name, "source_id": sourceID})
+	e.bundle.Publish(fmt.Sprintf("entity.%s.metadata", e.id), map[string]interface{}{
+		"name":        m.Name,
+		"local_name":  m.LocalName,
+		"source_name": m.SourceName,
+		"source_id":   m.SourceID,
+	})
+	return err
+}
+
+func (e *entityImpl) UpdateLocalName(name string) error {
+	e.mu.Lock()
+	e.metadata.LocalName = name
+	e.recalculateName()
+	m := e.metadata
+	e.mu.Unlock()
+
+	prefix := string(e.deviceID) + "." + string(e.id)
+	err := e.bundle.saveJSON(prefix+".json", m)
+	e.bundle.Publish(fmt.Sprintf("entity.%s.metadata", e.id), map[string]interface{}{
+		"name":       m.Name,
+		"local_name": m.LocalName,
+	})
+	return err
+}
+
+func (e *entityImpl) UpdateSourceName(name string) error {
+	e.mu.Lock()
+	e.metadata.SourceName = name
+	e.recalculateName()
+	m := e.metadata
+	e.mu.Unlock()
+
+	prefix := string(e.deviceID) + "." + string(e.id)
+	err := e.bundle.saveJSON(prefix+".json", m)
+	e.bundle.Publish(fmt.Sprintf("entity.%s.metadata", e.id), map[string]interface{}{
+		"name":        m.Name,
+		"source_name": m.SourceName,
+	})
+	return err
+}
+
+func (e *entityImpl) AddLabel(label string) error {
+	e.mu.Lock()
+	found := false
+	for _, l := range e.metadata.Labels {
+		if l == label {
+			found = true
+			break
+		}
+	}
+	if !found {
+		e.metadata.Labels = append(e.metadata.Labels, label)
+	}
+	m := e.metadata
+	e.mu.Unlock()
+
+	if found {
+		return nil
+	}
+
+	prefix := string(e.deviceID) + "." + string(e.id)
+	err := e.bundle.saveJSON(prefix+".json", m)
+	e.bundle.Publish(fmt.Sprintf("entity.%s.metadata", e.id), map[string]interface{}{"labels": m.Labels})
+	return err
+}
+
+func (e *entityImpl) RemoveLabel(label string) error {
+	e.mu.Lock()
+	newLabels := []string{}
+	found := false
+	for _, l := range e.metadata.Labels {
+		if l == label {
+			found = true
+			continue
+		}
+		newLabels = append(newLabels, l)
+	}
+	e.metadata.Labels = newLabels
+	m := e.metadata
+	e.mu.Unlock()
+
+	if !found {
+		return nil
+	}
+
+	prefix := string(e.deviceID) + "." + string(e.id)
+	err := e.bundle.saveJSON(prefix+".json", m)
+	e.bundle.Publish(fmt.Sprintf("entity.%s.metadata", e.id), map[string]interface{}{"labels": m.Labels})
+	return err
+}
+
+func (e *entityImpl) SetLabels(labels []string) error {
+	e.mu.Lock()
+	e.metadata.Labels = labels
+	m := e.metadata
+	e.mu.Unlock()
+
+	prefix := string(e.deviceID) + "." + string(e.id)
+	err := e.bundle.saveJSON(prefix+".json", m)
+	e.bundle.Publish(fmt.Sprintf("entity.%s.metadata", e.id), map[string]interface{}{"labels": labels})
+	return err
+}
+
+func (e *entityImpl) UpdateCapabilities(caps []string) error {
+	e.mu.Lock()
+	e.metadata.Capabilities = caps
+	m := e.metadata
+	e.mu.Unlock()
+
+	prefix := string(e.deviceID) + "." + string(e.id)
+	err := e.bundle.saveJSON(prefix+".json", m)
+	e.bundle.Publish(fmt.Sprintf("entity.%s.metadata", e.id), map[string]interface{}{"capabilities": caps})
 	return err
 }
 func (e *entityImpl) setState(enabled bool, status string) error {
@@ -142,6 +268,19 @@ func (e *entityImpl) UpdateProperties(props map[string]interface{}) error {
 	prefix := string(e.deviceID) + "." + string(e.id)
 	err := e.bundle.saveJSON(prefix+".state.json", s)
 	// Important: We publish the full state so the UI gets everything
+	e.Publish(fmt.Sprintf("entity.%s.state", e.id), props)
+	return err
+}
+
+func (e *entityImpl) SetProperties(props map[string]interface{}) error {
+	e.mu.Lock()
+	e.state.Properties = props
+	e.state.Interface = strings.ToLower(string(e.metadata.Type))
+	s := e.state
+	e.mu.Unlock()
+
+	prefix := string(e.deviceID) + "." + string(e.id)
+	err := e.bundle.saveJSON(prefix+".state.json", s)
 	e.Publish(fmt.Sprintf("entity.%s.state", e.id), props)
 	return err
 }
@@ -204,6 +343,9 @@ func (e *entityImpl) initWorker() {
 		e.worker.Close()
 		e.worker = nil
 	}
+	e.mu.Lock()
+	e.scriptCmdHandler = nil
+	e.mu.Unlock()
 
 	code := e.Script()
 	if code == "" || code == "-- OnLoad() {}" {
@@ -222,14 +364,12 @@ func (e *entityImpl) initWorker() {
 			json.Unmarshal(m.Data, &msg)
 			go w.OnEvent(msg)
 		})
-		e.cmdSub, _ = e.bundle.nc.Subscribe("entity."+string(e.id)+".command", func(m *nats.Msg) {
-			var msg sdk.Message
-			json.Unmarshal(m.Data, &msg)
-			cmd, _ := msg.Payload["command"].(string)
-			if cmd != "" {
-				w.OnCommand(cmd, msg.Payload)
-			}
-		})
+		e.mu.Lock()
+		e.scriptCmdHandler = func(cmd string, payload map[string]interface{}) {
+			w.OnCommand(cmd, payload)
+		}
+		e.ensureCommandSubscriptionLocked()
+		e.mu.Unlock()
 	} else {
 		e.bundle.Log().Error("Lua Compile Error [%s]: %v", e.id, err)
 	}
@@ -269,6 +409,20 @@ func (e *entityImpl) Publish(subj string, p map[string]interface{}) error {
 	data, _ := json.Marshal(msg)
 	return e.bundle.nc.Publish(subj, data)
 }
+func (e *entityImpl) SendCommand(cmd string, payload map[string]interface{}) error {
+	if e == nil || e.bundle == nil || e.bundle.nc == nil {
+		id := sdk.UUID("")
+		if e != nil {
+			id = e.id
+		}
+		return fmt.Errorf("entity %s command transport unavailable", id)
+	}
+	if payload == nil {
+		payload = make(map[string]interface{})
+	}
+	payload["command"] = cmd
+	return e.Publish("entity."+string(e.id)+".command", payload)
+}
 func (e *entityImpl) Subscribe(topic string) error {
 	if e.bundle.nc == nil {
 		return fmt.Errorf("no NATS connection")
@@ -296,7 +450,17 @@ func (e *entityImpl) Subscribe(topic string) error {
 
 func (e *entityImpl) GetByUUID(id sdk.UUID) (interface{}, bool) { return GetByUUID(id) }
 func (e *entityImpl) GetBySourceID(sid sdk.SourceID) (interface{}, bool) {
-	return GetBySourceID(sid)
+	dev, err := e.bundle.GetDevice(e.deviceID)
+	if err != nil {
+		return nil, false
+	}
+	return dev.GetBySourceID(sid)
+}
+func (e *entityImpl) GetByLabel(labels interface{}) []interface{} {
+	return GetByLabel(labels)
+}
+func (e *entityImpl) GetRemoteObject(id sdk.UUID) (interface{}, bool) {
+	return e.bundle.GetRemoteObject(id)
 }
 
 func (e *entityImpl) BeginRun(meta map[string]interface{}) (int, error) {
@@ -353,18 +517,25 @@ func (e *entityImpl) Fail(reason string, meta map[string]interface{}) error {
 }
 
 func (e *entityImpl) OnCommand(handler sdk.CommandHandler) {
-	e.bundle.Log().Info("Entity.OnCommand bound for entity %s", e.id)
+	e.bundle.Log().Info("Entity.OnCommand bound for entity %s (total handlers: %d)", e.id, len(e.handlers)+1)
 	if e.bundle.nc == nil {
 		return
 	}
 
 	e.mu.Lock()
-	if e.cmdSub != nil {
-		_ = e.cmdSub.Unsubscribe()
-	}
+	e.handlers = append(e.handlers, handler)
+	e.ensureCommandSubscriptionLocked()
+	e.mu.Unlock()
+}
 
+func (e *entityImpl) ensureCommandSubscriptionLocked() {
+	if e.bundle == nil || e.bundle.nc == nil || e.cmdSub != nil {
+		return
+	}
 	subject := fmt.Sprintf("entity.%s.command", e.id)
+	e.bundle.Log().Info("[CMDSUB] SUBSCRIBE entity command subject=%s", subject)
 	sub, _ := e.bundle.nc.Subscribe(subject, func(msg *nats.Msg) {
+		e.bundle.Log().Info("[CMDSUB] RECV entity command subject=%s bytes=%d", msg.Subject, len(msg.Data))
 		var m sdk.Message
 		json.Unmarshal(msg.Data, &m)
 		SafeRun(e.bundle.id, "Entity.OnCommand", func() {
@@ -373,12 +544,25 @@ func (e *entityImpl) OnCommand(handler sdk.CommandHandler) {
 				cmd, _ = m.Payload["action"].(string)
 			}
 			if cmd != "" {
-				handler(cmd, m.Payload)
+				e.mu.RLock()
+				userHandlers := make([]sdk.CommandHandler, len(e.handlers))
+				copy(userHandlers, e.handlers)
+				scriptHandler := e.scriptCmdHandler
+				e.mu.RUnlock()
+				handlers := make([]sdk.CommandHandler, 0, len(userHandlers)+1)
+				if scriptHandler != nil {
+					handlers = append(handlers, scriptHandler)
+				}
+				handlers = append(handlers, userHandlers...)
+
+				e.bundle.Log().Info("Entity %s dispatching command %s to %d handlers", e.id, cmd, len(handlers))
+				for _, h := range handlers {
+					h(cmd, m.Payload)
+				}
 			}
 		})
 	})
 	e.cmdSub = sub
-	e.mu.Unlock()
 }
 
 // Specialized Types
@@ -388,13 +572,13 @@ func (s *switchImpl) UpdateMetadata(name string, sid sdk.SourceID) error {
 	return s.entityImpl.UpdateMetadata(name, sid)
 }
 func (s *switchImpl) TurnOn() error {
-	return s.bundle.Publish(fmt.Sprintf("entity.%s.command", s.id), map[string]interface{}{"command": "TurnOn", "action": "TurnOn"})
+	return s.entityImpl.SendCommand("TurnOn", map[string]interface{}{"action": "TurnOn"})
 }
 func (s *switchImpl) TurnOff() error {
-	return s.bundle.Publish(fmt.Sprintf("entity.%s.command", s.id), map[string]interface{}{"command": "TurnOff", "action": "TurnOff"})
+	return s.entityImpl.SendCommand("TurnOff", map[string]interface{}{"action": "TurnOff"})
 }
 func (s *switchImpl) Toggle() error {
-	return s.bundle.Publish(fmt.Sprintf("entity.%s.command", s.id), map[string]interface{}{"command": "Toggle", "action": "Toggle"})
+	return s.entityImpl.SendCommand("Toggle", map[string]interface{}{"action": "Toggle"})
 }
 
 type lightImpl struct{ *entityImpl }
@@ -403,25 +587,25 @@ func (l *lightImpl) UpdateMetadata(name string, sid sdk.SourceID) error {
 	return l.entityImpl.UpdateMetadata(name, sid)
 }
 func (l *lightImpl) TurnOn() error {
-	return l.bundle.Publish(fmt.Sprintf("entity.%s.command", l.id), map[string]interface{}{"command": "TurnOn", "action": "TurnOn"})
+	return l.entityImpl.SendCommand("TurnOn", map[string]interface{}{"action": "TurnOn"})
 }
 func (l *lightImpl) TurnOff() error {
-	return l.bundle.Publish(fmt.Sprintf("entity.%s.command", l.id), map[string]interface{}{"command": "TurnOff", "action": "TurnOff"})
+	return l.entityImpl.SendCommand("TurnOff", map[string]interface{}{"action": "TurnOff"})
 }
 func (l *lightImpl) Toggle() error {
-	return l.bundle.Publish(fmt.Sprintf("entity.%s.command", l.id), map[string]interface{}{"command": "Toggle", "action": "Toggle"})
+	return l.entityImpl.SendCommand("Toggle", map[string]interface{}{"action": "Toggle"})
 }
 func (l *lightImpl) SetBrightness(level int) error {
-	return l.bundle.Publish(fmt.Sprintf("entity.%s.command", l.id), map[string]interface{}{"command": "SetBrightness", "level": level})
+	return l.entityImpl.SendCommand("SetBrightness", map[string]interface{}{"level": level})
 }
 func (l *lightImpl) SetRGB(r, g, b int) error {
-	return l.bundle.Publish(fmt.Sprintf("entity.%s.command", l.id), map[string]interface{}{"command": "SetRGB", "r": r, "g": g, "b": b})
+	return l.entityImpl.SendCommand("SetRGB", map[string]interface{}{"r": r, "g": g, "b": b})
 }
 func (l *lightImpl) SetTemperature(k int) error {
-	return l.bundle.Publish(fmt.Sprintf("entity.%s.command", l.id), map[string]interface{}{"command": "SetTemperature", "kelvin": k})
+	return l.entityImpl.SendCommand("SetTemperature", map[string]interface{}{"kelvin": k})
 }
 func (l *lightImpl) SetScene(s string) error {
-	return l.bundle.Publish(fmt.Sprintf("entity.%s.command", l.id), map[string]interface{}{"command": "SetScene", "scene": s})
+	return l.entityImpl.SendCommand("SetScene", map[string]interface{}{"scene": s})
 }
 
 type sensorImpl struct{ *entityImpl }
@@ -430,16 +614,16 @@ type binarySensorImpl struct{ *entityImpl }
 type coverImpl struct{ *entityImpl }
 
 func (c *coverImpl) Open() error {
-	return c.bundle.Publish(fmt.Sprintf("entity.%s.command", c.id), map[string]interface{}{"command": "Open", "action": "Open"})
+	return c.entityImpl.SendCommand("Open", map[string]interface{}{"action": "Open"})
 }
 func (c *coverImpl) Close() error {
-	return c.bundle.Publish(fmt.Sprintf("entity.%s.command", c.id), map[string]interface{}{"command": "Close", "action": "Close"})
+	return c.entityImpl.SendCommand("Close", map[string]interface{}{"action": "Close"})
 }
 func (c *coverImpl) Stop() error {
-	return c.bundle.Publish(fmt.Sprintf("entity.%s.command", c.id), map[string]interface{}{"command": "Stop", "action": "Stop"})
+	return c.entityImpl.SendCommand("Stop", map[string]interface{}{"action": "Stop"})
 }
 func (c *coverImpl) SetPosition(pos int) error {
-	return c.bundle.Publish(fmt.Sprintf("entity.%s.command", c.id), map[string]interface{}{"command": "SetPosition", "position": pos})
+	return c.entityImpl.SendCommand("SetPosition", map[string]interface{}{"position": pos})
 }
 
 type cameraImpl struct{ *entityImpl }

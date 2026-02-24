@@ -32,6 +32,8 @@ type HostBridge interface {
 	// Global Lookups
 	GetByUUID(id sdk.UUID) (interface{}, bool)
 	GetBySourceID(sid sdk.SourceID) (interface{}, bool)
+	GetByLabel(labels interface{}) []interface{}
+	GetRemoteObject(id sdk.UUID) (interface{}, bool)
 
 	// Lifecycle
 	BeginRun(meta map[string]interface{}) (int, error)
@@ -157,6 +159,65 @@ func NewWorker(id sdk.UUID, code string, logger sdk.Logger, bridge HostBridge) (
 		return 1
 	}))
 
+	L.SetField(w.ctx, "GetByLabel", L.NewFunction(func(L *lua.LState) int {
+		var labels interface{}
+		arg := L.CheckAny(1)
+		if s, ok := arg.(lua.LString); ok {
+			labels = string(s)
+		} else if t, ok := arg.(*lua.LTable); ok {
+			labels = FromLuaValue(t)
+		}
+
+		objs := bridge.GetByLabel(labels)
+		t := L.NewTable()
+		for i, obj := range objs {
+			t.RawSetInt(i+1, WrapObjectToLua(L, obj))
+		}
+		L.Push(t)
+		return 1
+	}))
+
+	// Core Global API
+	coreTable := L.NewTable()
+	L.SetField(w.ctx, "core", coreTable)
+
+	L.SetField(coreTable, "GetByUUID", L.NewFunction(func(L *lua.LState) int {
+		id := sdk.UUID(L.CheckString(1))
+		// For core.GetByUUID, we force a remote lookup if not found locally
+		obj, ok := bridge.GetByUUID(id)
+		if ok {
+			L.Push(WrapObjectToLua(L, obj))
+			return 1
+		}
+
+		// This bridge method needs to be added to HostBridge
+		if remote, ok := bridge.GetRemoteObject(id); ok {
+			L.Push(WrapObjectToLua(L, remote))
+			return 1
+		}
+
+		L.Push(lua.LNil)
+		return 1
+	}))
+
+	L.SetField(coreTable, "GetByLabel", L.NewFunction(func(L *lua.LState) int {
+		var labels interface{}
+		arg := L.CheckAny(1)
+		if s, ok := arg.(lua.LString); ok {
+			labels = string(s)
+		} else if t, ok := arg.(*lua.LTable); ok {
+			labels = FromLuaValue(t)
+		}
+
+		objs := bridge.GetByLabel(labels) // Already globalized in my previous refactor
+		t := L.NewTable()
+		for i, obj := range objs {
+			t.RawSetInt(i+1, WrapObjectToLua(L, obj))
+		}
+		L.Push(t)
+		return 1
+	}))
+
 	// Lifecycle API
 	L.SetField(w.ctx, "BeginRun", L.NewFunction(func(L *lua.LState) int {
 		meta := make(map[string]interface{})
@@ -259,30 +320,101 @@ func (w *Worker) Close() {
 
 func WrapObjectToLua(L *lua.LState, obj interface{}) *lua.LTable {
 	t := L.NewTable()
+	type commandSender interface {
+		SendCommand(string, map[string]interface{}) error
+	}
 	if dev, ok := obj.(sdk.Device); ok {
 		id := dev.ID()
 		L.SetField(t, "ID", lua.LString(id))
 		L.SetField(t, "type", lua.LString("device"))
+		L.SetField(t, "GetMetadata", L.NewFunction(func(L *lua.LState) int {
+			m := dev.Metadata()
+			mt := L.NewTable()
+			L.SetField(mt, "id", lua.LString(m.ID))
+			L.SetField(mt, "name", lua.LString(m.Name))
+			L.SetField(mt, "source_id", lua.LString(m.SourceID))
+			if m.Labels != nil {
+				L.SetField(mt, "labels", ToLuaValue(L, m.Labels))
+			} else {
+				L.SetField(mt, "labels", L.NewTable())
+			}
+			L.Push(mt)
+			return 1
+		}))
+		L.SetField(t, "GetState", L.NewFunction(func(L *lua.LState) int {
+			s := dev.State()
+			st := L.NewTable()
+			L.SetField(st, "enabled", lua.LBool(s.Enabled))
+			L.SetField(st, "status", lua.LString(s.Status))
+			if s.Properties != nil {
+				L.SetField(st, "properties", ToLuaValue(L, s.Properties))
+			} else {
+				L.SetField(st, "properties", L.NewTable())
+			}
+			L.Push(st)
+			return 1
+		}))
 		L.SetField(t, "SendCommand", L.NewFunction(func(L *lua.LState) int {
 			cmd := L.CheckString(1)
-			payload := FromLuaValue(L.CheckTable(2)).(map[string]interface{})
-			if payload == nil {
+			payloadRaw := L.OptTable(2, nil)
+			var payload map[string]interface{}
+			if payloadRaw != nil {
+				payload = FromLuaValue(payloadRaw).(map[string]interface{})
+			} else {
 				payload = make(map[string]interface{})
 			}
-			payload["command"] = cmd
-			dev.Publish("device."+string(id)+".command", payload)
+			if sender, ok := obj.(commandSender); ok {
+				if err := sender.SendCommand(cmd, payload); err != nil {
+					L.RaiseError("SendCommand(%s) failed for device %s: %v", cmd, id, err)
+					return 0
+				}
+				return 0
+			}
+			L.RaiseError("device %s does not implement SendCommand", id)
 			return 0
 		}))
 		return t
 	}
 	if ent, ok := obj.(sdk.Entity); ok {
 		id := ent.ID()
-		meta := ent.Metadata()
 		L.SetField(t, "ID", lua.LString(id))
 		L.SetField(t, "type", lua.LString("entity"))
+		L.SetField(t, "GetMetadata", L.NewFunction(func(L *lua.LState) int {
+			m := ent.Metadata()
+			mt := L.NewTable()
+			L.SetField(mt, "id", lua.LString(m.ID))
+			L.SetField(mt, "name", lua.LString(m.Name))
+			L.SetField(mt, "source_id", lua.LString(m.SourceID))
+			L.SetField(mt, "type", lua.LString(m.Type))
+			if m.Capabilities != nil {
+				L.SetField(mt, "capabilities", ToLuaValue(L, m.Capabilities))
+			} else {
+				L.SetField(mt, "capabilities", L.NewTable())
+			}
+			if m.Labels != nil {
+				L.SetField(mt, "labels", ToLuaValue(L, m.Labels))
+			} else {
+				L.SetField(mt, "labels", L.NewTable())
+			}
+			L.Push(mt)
+			return 1
+		}))
+		L.SetField(t, "GetState", L.NewFunction(func(L *lua.LState) int {
+			s := ent.State()
+			st := L.NewTable()
+			L.SetField(st, "enabled", lua.LBool(s.Enabled))
+			L.SetField(st, "status", lua.LString(s.Status))
+			if s.Properties != nil {
+				L.SetField(st, "properties", ToLuaValue(L, s.Properties))
+			} else {
+				L.SetField(st, "properties", L.NewTable())
+			}
+			L.Push(st)
+			return 1
+		}))
 		L.SetField(t, "HasCapability", L.NewFunction(func(L *lua.LState) int {
 			cap := L.CheckString(1)
-			for _, c := range meta.Capabilities {
+			for _, c := range ent.Metadata().Capabilities {
 				if c == cap {
 					L.Push(lua.LTrue)
 					return 1
@@ -293,12 +425,21 @@ func WrapObjectToLua(L *lua.LState, obj interface{}) *lua.LTable {
 		}))
 		L.SetField(t, "SendCommand", L.NewFunction(func(L *lua.LState) int {
 			cmd := L.CheckString(1)
-			payload := FromLuaValue(L.CheckTable(2)).(map[string]interface{})
-			if payload == nil {
+			payloadRaw := L.OptTable(2, nil)
+			var payload map[string]interface{}
+			if payloadRaw != nil {
+				payload = FromLuaValue(payloadRaw).(map[string]interface{})
+			} else {
 				payload = make(map[string]interface{})
 			}
-			payload["command"] = cmd
-			ent.Publish("entity."+string(id)+".command", payload)
+			if sender, ok := obj.(commandSender); ok {
+				if err := sender.SendCommand(cmd, payload); err != nil {
+					L.RaiseError("SendCommand(%s) failed for entity %s: %v", cmd, id, err)
+					return 0
+				}
+				return 0
+			}
+			L.RaiseError("entity %s does not implement SendCommand", id)
 			return 0
 		}))
 		return t
@@ -321,18 +462,27 @@ func ToLuaValue(L *lua.LState, v interface{}) lua.LValue {
 		return lua.LString(val)
 	case map[string]interface{}:
 		t := L.NewTable()
+		if val == nil {
+			return t
+		}
 		for k, v2 := range val {
 			L.SetField(t, k, ToLuaValue(L, v2))
 		}
 		return t
 	case []interface{}:
 		t := L.NewTable()
+		if val == nil {
+			return t
+		}
 		for i, v2 := range val {
 			L.RawSetInt(t, i+1, ToLuaValue(L, v2))
 		}
 		return t
 	case []string:
 		t := L.NewTable()
+		if val == nil {
+			return t
+		}
 		for i, v2 := range val {
 			L.RawSetInt(t, i+1, lua.LString(v2))
 		}

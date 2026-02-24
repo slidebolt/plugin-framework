@@ -3,8 +3,9 @@ package framework
 import (
 	"crypto/rand"
 	"fmt"
-	"os"
 	"github.com/slidebolt/plugin-sdk"
+	"os"
+	"runtime/debug"
 )
 
 func generateUUID() sdk.UUID {
@@ -19,7 +20,7 @@ func SafeRun(bundleID sdk.UUID, label string, fn func()) {
 			bundlesMu.RLock()
 			b := bundles[bundleID]
 			bundlesMu.RUnlock()
-			errMsg := fmt.Sprintf("PANIC RECOVERED in [%s]: %v", label, r)
+			errMsg := fmt.Sprintf("PANIC RECOVERED in [%s]: %v\n%s", label, r, debug.Stack())
 			if b != nil {
 				b.Log().Error(errMsg)
 			} else {

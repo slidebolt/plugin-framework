@@ -18,6 +18,10 @@ func (r *frameworkRegistry) GetBySourceID(sid sdk.SourceID) (interface{}, bool) 
 	return GetBySourceID(sid)
 }
 
+func (r *frameworkRegistry) GetByLabel(labels interface{}) []interface{} {
+	return GetByLabel(labels)
+}
+
 func (r *frameworkRegistry) GetDevices() []sdk.Device {
 	return GetDevices()
 }

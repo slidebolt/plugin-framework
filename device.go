@@ -3,11 +3,11 @@ package framework
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/slidebolt/plugin-framework/pkg/script"
+	"github.com/slidebolt/plugin-sdk"
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"github.com/slidebolt/plugin-framework/pkg/script"
-	"github.com/slidebolt/plugin-sdk"
 	"strings"
 	"sync"
 	"time"
@@ -16,16 +16,18 @@ import (
 )
 
 type deviceImpl struct {
-	id        sdk.UUID
-	bundle    *bundleImpl
-	worker    *script.Worker
-	sub       *nats.Subscription
-	cmdSub    *nats.Subscription
-	extraSubs []*nats.Subscription
-	metadata  sdk.DeviceMetadata
-	state     sdk.DeviceState
-	raw       map[string]interface{}
-	mu        sync.RWMutex
+	id               sdk.UUID
+	bundle           *bundleImpl
+	worker           *script.Worker
+	sub              *nats.Subscription
+	cmdSub           *nats.Subscription
+	handlers         []sdk.CommandHandler
+	scriptCmdHandler sdk.CommandHandler
+	extraSubs        []*nats.Subscription
+	metadata         sdk.DeviceMetadata
+	state            sdk.DeviceState
+	raw              map[string]interface{}
+	mu               sync.RWMutex
 }
 
 func (d *deviceImpl) MarshalJSON() ([]byte, error) {
@@ -57,7 +59,8 @@ func (d *deviceImpl) MarshalJSON() ([]byte, error) {
 	})
 }
 
-func (d *deviceImpl) ID() sdk.UUID { return d.id }
+func (d *deviceImpl) ID() sdk.UUID       { return d.id }
+func (d *deviceImpl) BundleID() sdk.UUID { return d.bundle.id }
 func (d *deviceImpl) Metadata() sdk.DeviceMetadata {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -82,15 +85,122 @@ func (d *deviceImpl) StateScript() string {
 	return string(b)
 }
 
+func (d *deviceImpl) recalculateName() {
+	if d.metadata.LocalName != "" {
+		d.metadata.Name = d.metadata.LocalName
+	} else if d.metadata.SourceName != "" {
+		d.metadata.Name = d.metadata.SourceName
+	} else if d.metadata.SourceID != "" {
+		d.metadata.Name = string(d.metadata.SourceID)
+	} else {
+		d.metadata.Name = string(d.id)
+	}
+}
+
 func (d *deviceImpl) UpdateMetadata(name string, sourceID sdk.SourceID) error {
 	d.mu.Lock()
-	d.metadata.Name = name
+	d.metadata.SourceName = name
 	d.metadata.SourceID = sourceID
+	d.recalculateName()
 	m := d.metadata
 	d.mu.Unlock()
 
 	err := d.bundle.saveJSON(string(d.id)+".json", m)
-	d.bundle.Publish(fmt.Sprintf("device.%s.metadata", d.id), map[string]interface{}{"name": name, "source_id": sourceID})
+	d.bundle.Publish(fmt.Sprintf("device.%s.metadata", d.id), map[string]interface{}{
+		"name":        m.Name,
+		"local_name":  m.LocalName,
+		"source_name": m.SourceName,
+		"source_id":   m.SourceID,
+	})
+	return err
+}
+
+func (d *deviceImpl) UpdateLocalName(name string) error {
+	d.mu.Lock()
+	d.metadata.LocalName = name
+	d.recalculateName()
+	m := d.metadata
+	d.mu.Unlock()
+
+	err := d.bundle.saveJSON(string(d.id)+".json", m)
+	d.bundle.Publish(fmt.Sprintf("device.%s.metadata", d.id), map[string]interface{}{
+		"name":       m.Name,
+		"local_name": m.LocalName,
+	})
+	return err
+}
+
+func (d *deviceImpl) UpdateSourceName(name string) error {
+	d.mu.Lock()
+	d.metadata.SourceName = name
+	d.recalculateName()
+	m := d.metadata
+	d.mu.Unlock()
+
+	err := d.bundle.saveJSON(string(d.id)+".json", m)
+	d.bundle.Publish(fmt.Sprintf("device.%s.metadata", d.id), map[string]interface{}{
+		"name":        m.Name,
+		"source_name": m.SourceName,
+	})
+	return err
+}
+
+func (d *deviceImpl) AddLabel(label string) error {
+	d.mu.Lock()
+	found := false
+	for _, l := range d.metadata.Labels {
+		if l == label {
+			found = true
+			break
+		}
+	}
+	if !found {
+		d.metadata.Labels = append(d.metadata.Labels, label)
+	}
+	m := d.metadata
+	d.mu.Unlock()
+
+	if found {
+		return nil
+	}
+
+	err := d.bundle.saveJSON(string(d.id)+".json", m)
+	d.bundle.Publish(fmt.Sprintf("device.%s.metadata", d.id), map[string]interface{}{"labels": m.Labels})
+	return err
+}
+
+func (d *deviceImpl) RemoveLabel(label string) error {
+	d.mu.Lock()
+	newLabels := []string{}
+	found := false
+	for _, l := range d.metadata.Labels {
+		if l == label {
+			found = true
+			continue
+		}
+		newLabels = append(newLabels, l)
+	}
+	d.metadata.Labels = newLabels
+	m := d.metadata
+	d.mu.Unlock()
+
+	if !found {
+		return nil
+	}
+
+	err := d.bundle.saveJSON(string(d.id)+".json", m)
+	d.bundle.Publish(fmt.Sprintf("device.%s.metadata", d.id), map[string]interface{}{"labels": m.Labels})
+	return err
+}
+
+func (d *deviceImpl) SetLabels(labels []string) error {
+	d.mu.Lock()
+	d.metadata.Labels = labels
+	m := d.metadata
+	d.mu.Unlock()
+
+	err := d.bundle.saveJSON(string(d.id)+".json", m)
+	d.bundle.Publish(fmt.Sprintf("device.%s.metadata", d.id), map[string]interface{}{"labels": labels})
 	return err
 }
 func (d *deviceImpl) setState(enabled bool, status string) error {
@@ -142,6 +252,18 @@ func (d *deviceImpl) UpdateProperties(props map[string]interface{}) error {
 	for k, v := range props {
 		d.state.Properties[k] = v
 	}
+	d.state.Interface = "device"
+	s := d.state
+	d.mu.Unlock()
+
+	err := d.bundle.saveJSON(string(d.id)+".state.json", s)
+	d.Publish(fmt.Sprintf("device.%s.state", d.id), props)
+	return err
+}
+
+func (d *deviceImpl) SetProperties(props map[string]interface{}) error {
+	d.mu.Lock()
+	d.state.Properties = props
 	d.state.Interface = "device"
 	s := d.state
 	d.mu.Unlock()
@@ -206,6 +328,9 @@ func (d *deviceImpl) initWorker() {
 		d.worker.Close()
 		d.worker = nil
 	}
+	d.mu.Lock()
+	d.scriptCmdHandler = nil
+	d.mu.Unlock()
 
 	code := d.Script()
 	if code == "" || code == "-- OnLoad() {}" {
@@ -224,14 +349,12 @@ func (d *deviceImpl) initWorker() {
 			json.Unmarshal(m.Data, &msg)
 			go w.OnEvent(msg)
 		})
-		d.cmdSub, _ = d.bundle.nc.Subscribe("device."+string(d.id)+".command", func(m *nats.Msg) {
-			var msg sdk.Message
-			json.Unmarshal(m.Data, &msg)
-			cmd, _ := msg.Payload["command"].(string)
-			if cmd != "" {
-				w.OnCommand(cmd, msg.Payload)
-			}
-		})
+		d.mu.Lock()
+		d.scriptCmdHandler = func(cmd string, payload map[string]interface{}) {
+			w.OnCommand(cmd, payload)
+		}
+		d.ensureCommandSubscriptionLocked()
+		d.mu.Unlock()
 	} else {
 		d.bundle.Log().Error("Lua Compile Error [%s]: %v", d.id, err)
 	}
@@ -262,6 +385,20 @@ func (d *deviceImpl) Publish(subj string, p map[string]interface{}) error {
 	data, _ := json.Marshal(msg)
 	return d.bundle.nc.Publish(subj, data)
 }
+func (d *deviceImpl) SendCommand(cmd string, payload map[string]interface{}) error {
+	if d == nil || d.bundle == nil || d.bundle.nc == nil {
+		id := sdk.UUID("")
+		if d != nil {
+			id = d.id
+		}
+		return fmt.Errorf("device %s command transport unavailable", id)
+	}
+	if payload == nil {
+		payload = make(map[string]interface{})
+	}
+	payload["command"] = cmd
+	return d.Publish("device."+string(d.id)+".command", payload)
+}
 func (d *deviceImpl) Subscribe(topic string) error {
 	if d.bundle.nc == nil {
 		return fmt.Errorf("no NATS connection")
@@ -289,7 +426,13 @@ func (d *deviceImpl) Subscribe(topic string) error {
 
 func (d *deviceImpl) GetByUUID(id sdk.UUID) (interface{}, bool) { return GetByUUID(id) }
 func (d *deviceImpl) GetBySourceID(sid sdk.SourceID) (interface{}, bool) {
-	return GetBySourceID(sid)
+	return d.bundle.GetBySourceID(sid)
+}
+func (d *deviceImpl) GetByLabel(labels interface{}) []interface{} {
+	return GetByLabel(labels)
+}
+func (d *deviceImpl) GetRemoteObject(id sdk.UUID) (interface{}, bool) {
+	return d.bundle.GetRemoteObject(id)
 }
 
 func (d *deviceImpl) BeginRun(meta map[string]interface{}) (int, error) {
@@ -430,57 +573,50 @@ func (d *deviceImpl) DeleteEntity(id sdk.UUID) error {
 }
 
 func (d *deviceImpl) OnCommand(handler sdk.CommandHandler) {
-
-	d.bundle.Log().Info("Device.OnCommand bound for device %s", d.id)
-
+	d.bundle.Log().Info("Device.OnCommand bound for device %s (total handlers: %d)", d.id, len(d.handlers)+1)
 	if d.bundle.nc == nil {
-
 		return
-
 	}
-
-
 
 	d.mu.Lock()
-
-	if d.cmdSub != nil {
-
-		_ = d.cmdSub.Unsubscribe()
-
-	}
-
-
-
-	subject := fmt.Sprintf("device.%s.command", d.id)
-
-	sub, _ := d.bundle.nc.Subscribe(subject, func(msg *nats.Msg) {
-
-		var m sdk.Message
-
-		json.Unmarshal(msg.Data, &m)
-
-		SafeRun(d.bundle.id, "Device.OnCommand", func() {
-
-			cmd, _ := m.Payload["command"].(string)
-
-			if cmd == "" {
-
-				cmd, _ = m.Payload["action"].(string)
-
-			}
-
-			if cmd != "" {
-
-				handler(cmd, m.Payload)
-
-			}
-
-		})
-
-	})
-
-	d.cmdSub = sub
-
+	d.handlers = append(d.handlers, handler)
+	d.ensureCommandSubscriptionLocked()
 	d.mu.Unlock()
+}
 
+func (d *deviceImpl) ensureCommandSubscriptionLocked() {
+	if d.bundle == nil || d.bundle.nc == nil || d.cmdSub != nil {
+		return
+	}
+	subject := fmt.Sprintf("device.%s.command", d.id)
+	d.bundle.Log().Info("[CMDSUB] SUBSCRIBE device command subject=%s", subject)
+	sub, _ := d.bundle.nc.Subscribe(subject, func(msg *nats.Msg) {
+		d.bundle.Log().Info("[CMDSUB] RECV device command subject=%s bytes=%d", msg.Subject, len(msg.Data))
+		var m sdk.Message
+		json.Unmarshal(msg.Data, &m)
+		SafeRun(d.bundle.id, "Device.OnCommand", func() {
+			cmd, _ := m.Payload["command"].(string)
+			if cmd == "" {
+				cmd, _ = m.Payload["action"].(string)
+			}
+			if cmd != "" {
+				d.mu.RLock()
+				userHandlers := make([]sdk.CommandHandler, len(d.handlers))
+				copy(userHandlers, d.handlers)
+				scriptHandler := d.scriptCmdHandler
+				d.mu.RUnlock()
+				handlers := make([]sdk.CommandHandler, 0, len(userHandlers)+1)
+				if scriptHandler != nil {
+					handlers = append(handlers, scriptHandler)
+				}
+				handlers = append(handlers, userHandlers...)
+
+				d.bundle.Log().Info("Device %s dispatching command %s to %d handlers", d.id, cmd, len(handlers))
+				for _, h := range handlers {
+					h(cmd, m.Payload)
+				}
+			}
+		})
+	})
+	d.cmdSub = sub
 }
